@@ -1,4 +1,5 @@
 use std::{io, time::Duration};
+use tokio::time::interval;
 
 use ratatui::{
     prelude::*,
@@ -11,12 +12,14 @@ use crossterm::{
 };
 
 use netstat2::{get_sockets_info, AddressFamilyFlags, ProtocolFlags, ProtocolSocketInfo, SocketInfo, error::Error as NetstatError};
+use sysinfo::System;
 
 mod ui;
 use ui::stateful_list::StatefulList;
 
 struct App {
     processes: Result<StatefulList<SocketInfo>, NetstatError>,
+    system: System,
 }
 
 impl App {
@@ -27,11 +30,43 @@ impl App {
 
         App {
             processes: sockets_info.map(|s| StatefulList::with_items(s)),
+            system: System::new_all(),
         }
+    }
+
+    fn update(&mut self) {
+        let af_flags = AddressFamilyFlags::all();
+        let proto_flags = ProtocolFlags::all();
+        let new_sockets_info_result = get_sockets_info(af_flags, proto_flags);
+
+        match new_sockets_info_result {
+            Ok(new_sockets_info) => {
+                if let Ok(processes) = &mut self.processes {
+                    let previously_selected = processes.state.selected();
+                    processes.items = new_sockets_info;
+                    if let Some(previously_selected) = previously_selected {
+                        if previously_selected >= processes.items.len() {
+                            if processes.items.is_empty() {
+                                processes.state.select(None);
+                            } else {
+                                processes.state.select(Some(processes.items.len() - 1));
+                            }
+                        }
+                    }
+                } else {
+                    self.processes = Ok(StatefulList::with_items(new_sockets_info));
+                }
+            }
+            Err(e) => {
+                self.processes = Err(e);
+            }
+        }
+        self.system.refresh_all();
     }
 }
 
-fn main() -> io::Result<()> {
+#[tokio::main]
+async fn main() -> io::Result<()> {
     // setup terminal
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -41,7 +76,7 @@ fn main() -> io::Result<()> {
 
     // create app and run it
     let app = App::new();
-    let res = run_app(&mut terminal, app);
+    let res = run_app(&mut terminal, app).await;
 
     // restore terminal
     disable_raw_mode()?;
@@ -59,25 +94,40 @@ fn main() -> io::Result<()> {
     Ok(())
 }
 
-fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Result<()> {
+async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Result<()> {
+    let mut ticker = interval(Duration::from_secs(2));
+
     loop {
         terminal.draw(|f| ui(f, &mut app))?;
 
-        if event::poll(Duration::from_millis(250))? {
-            if let Event::Key(key) = event::read()? {
-                match key.code {
-                    KeyCode::Char('q') => return Ok(()),
-                    KeyCode::Down => {
-                        if let Ok(processes) = &mut app.processes {
-                            processes.next();
+        let event = tokio::task::spawn_blocking(move || -> io::Result<Option<Event>> {
+            if event::poll(Duration::from_millis(250))? {
+                Ok(Some(event::read()?))
+            } else {
+                Ok(None)
+            }
+        });
+
+        tokio::select! {
+            _ = ticker.tick() => {
+                app.update();
+            },
+            res = event => {
+                if let Ok(Ok(Some(Event::Key(key)))) = res {
+                     match key.code {
+                        KeyCode::Char('q') => return Ok(()),
+                        KeyCode::Down => {
+                            if let Ok(processes) = &mut app.processes {
+                                processes.next();
+                            }
                         }
-                    }
-                    KeyCode::Up => {
-                        if let Ok(processes) = &mut app.processes {
-                            processes.previous();
+                        KeyCode::Up => {
+                            if let Ok(processes) = &mut app.processes {
+                                processes.previous();
+                            }
                         }
+                        _ => {}
                     }
-                    _ => {}
                 }
             }
         }
@@ -148,10 +198,34 @@ fn ui(frame: &mut Frame, app: &mut App) {
         }
     }
 
-    frame.render_widget(
-        Block::new().borders(Borders::ALL).title("Details"),
-        top_chunks[1],
-    );
+    let details_block = Block::default().borders(Borders::ALL).title("Details");
+    let details_text = if let Ok(processes) = &app.processes {
+        if let Some(selected) = processes.state.selected() {
+            let socket_info = &processes.items[selected];
+            let pids = &socket_info.associated_pids;
+            if let Some(pid) = pids.first() {
+                if let Some(process) = app.system.process(sysinfo::Pid::from_u32(*pid)) {
+                    let mut text = Vec::new();
+                    text.push(Line::from(format!("PID: {}", process.pid())));
+                    text.push(Line::from(format!("Name: {}", process.name())));
+                    text.push(Line::from(format!("Status: {:?}", process.status())));
+                    text.push(Line::from(format!("CPU: {:.2}%", process.cpu_usage())));
+                    text.push(Line::from(format!("Memory: {} KB", process.memory())));
+                    text
+                } else {
+                    vec![Line::from("Process not found.")]
+                }
+            } else {
+                vec![Line::from("No process associated with this socket.")]
+            }
+        } else {
+            vec![Line::from("No process selected.")]
+        }
+    } else {
+        vec![Line::from("Error loading processes.")]
+    };
+    let details_paragraph = Paragraph::new(details_text).block(details_block);
+    frame.render_widget(details_paragraph, top_chunks[1]);
     frame.render_widget(
         Block::new().borders(Borders::ALL).title("Logs"),
         chunks[1],
